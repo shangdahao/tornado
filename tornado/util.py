@@ -282,6 +282,10 @@ class Configurable(object):
     Configurable subclasses must define the class methods
     `configurable_base` and `configurable_default`, and use the instance
     method `initialize` instead of ``__init__``.
+    
+    子类包括：
+    IOLoop
+    HTTPServer
     """
     __impl_class = None  # type: type
     __impl_kwargs = None  # type: Dict[str, Any]
@@ -290,6 +294,7 @@ class Configurable(object):
         base = cls.configurable_base()
         init_kwargs = {}
         if cls is base:
+            #  ``epoll`` (Linux) or ``kqueue`` (BSD and Mac OS X)
             impl = cls.configured_class()
             if base.__impl_kwargs:
                 init_kwargs.update(base.__impl_kwargs)
