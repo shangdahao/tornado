@@ -28,6 +28,8 @@ In addition to I/O events, the `IOLoop` can also schedule time-based events.
 这个 module 是异步机制的核心，它保存了所有打开的file descriptors 和其 handlers。 它的工作是选择那些
 准备读或写的 file descriptor，并调用其 handler。
 
+ioloop 实际上是对 epoll(kqueue) 的封装，并加入了一些对上层事件的处理和 server 相关的底层处理。
+
 tornado 优秀的大并发处理能力得益于它的 web server 从底层开始就自己实现了一整套基于 epoll 的单线程异步架构。
 
 epoll：
@@ -44,10 +46,6 @@ socket 通信时的服务端，当它接受（ accept ）一个连接并建立�
 为了解决这个问题， epoll 被创造出来，它的概念和 poll 类似，不过每次轮询时，他只会把有数据活跃的 socket 挑出来轮询，这样在有大量连接时轮询就节省了大量时间。
 
 
-
-参考：
-https://segmentfault.com/a/1190000005659237
-https://www.zhihu.com/question/20122137
 
 """
 
@@ -637,6 +635,9 @@ class IOLoop(Configurable):
 
         To add a callback from a signal handler, see
         `add_callback_from_signal`.
+        
+        这个函数是最简单的，在ioloop开启后执行的回调函数callback，args和*kwargs都是这个回调函数的参数。
+        一般我们的server都是单进程单线程的，即使是多线程，那么这个函数也是安全的。
         """
         raise NotImplementedError()
 
@@ -649,6 +650,9 @@ class IOLoop(Configurable):
         Callbacks added with this method will be run without any
         `.stack_context`, to avoid picking up the context of the function
         that was interrupted by the signal.
+        
+        这个函数和上面的很类似，只不过他是在without any stack_context的时候去执
+        关于stack_context，查阅http://www.tornadoweb.org/en/stable/stack_context.html#module-tornado.stack_context。
         """
         raise NotImplementedError()
 
@@ -671,6 +675,9 @@ class IOLoop(Configurable):
 
         The callback is invoked with one argument, the
         `.Future`.
+        
+        这个函数呢也是添加一个callback函数，当给定的这个future执行完的时候，callback会去执行，这个函数有唯一的一个参数就是这个future对象。
+        关于future呢???
         """
         assert is_future(future)
         callback = stack_context.wrap(callback)
@@ -797,25 +804,50 @@ class PollIOLoop(IOLoop):
     def initialize(self, impl, time_func=None, **kwargs):
         super(PollIOLoop, self).initialize(**kwargs)
         self._impl = impl
+
+        # 子进程在fork出来的时候，使用了写时复制（COW，Copy-On-Write）方式获得父进程的数据空间、 堆和栈副本，
+        # 这其中也包括文件描述符。刚刚fork成功时，父子进程中相同的文件描述符指向系统文件表中的同一项，
+        # 接着，一般我们会调用exec执行另一个程序，此时会用全新的程序替换子进程的正文，数据，堆和栈等。
+        # 此时保存文件描述符的变量当然也不存在了，我们就无法关闭无用的文件描述符了。
+        # 所以通常我们会fork子进程后在子进程中直接执行close关掉无用的文件描述符，然后再执行exec。
+        # 所以 close_exec 执行的其实就是 关闭 ＋ 执行的作用。
+        # 详情可以查看： http://blog.csdn.net/ljxfblog/article/details/41680115
         if hasattr(self._impl, 'fileno'):
             set_close_exec(self._impl.fileno())
         self.time_func = time_func or time.time
+
+        # 储存被 epoll 监听的 handler，与打开它的文件描述符 ( file descriptor 简称 fd ) 一一对应
         self._handlers = {}
+
+        # 储存 epoll 返回的活跃的 fd event pairs
         self._events = {}
+
+        # 储存各个 fd 回调函数的列表
         self._callbacks = collections.deque()
+
+        # 一个最小堆结构，按照超时时间从小到大排列的 fd 的任务堆（ 通常这个任务都会包含一个 callback ）
         self._timeouts = []
+
+        # 关于 timeout 的计数器
         self._cancellations = 0
         self._running = False
         self._stopped = False
         self._closing = False
+
+        # 当前线程堆标识符 （ thread identify ）
         self._thread_ident = None
         self._pid = os.getpid()
+
+        # 系统信号， 主要用来在 epoll_wait 时判断是否会有 signal alarm 打断 epoll
         self._blocking_signal_threshold = None
         self._timeout_counter = itertools.count()
 
         # Create a pipe that we send bogus data to when we want to wake
         # the I/O loop when it is idle
+        # 一个 waker 类，主要是对于管道 pipe 的操作，因为 ioloop 属于底层的数据操作，这里 epoll 监听的是 pipe
         self._waker = Waker()
+
+        # 将管道加入 epoll 监听，对于 web server 初始化时只需要关心 READ 事件
         self.add_handler(self._waker.fileno(),
                          lambda fd, events: self._waker.consume(),
                          self.READ)
@@ -826,6 +858,7 @@ class PollIOLoop(IOLoop):
 
     @classmethod
     def configurable_default(cls):
+        # Python select doc https://docs.python.org/3/library/select.html
         if hasattr(select, "epoll"):
             from tornado.platform.epoll import EPollIOLoop
             return EPollIOLoop
@@ -850,6 +883,12 @@ class PollIOLoop(IOLoop):
             self._executor.shutdown()
 
     def add_handler(self, fd, handler, events):
+        """
+        注册一个handler，从fd那里接受事件。 
+        fd呢就是一个描述符，events就是要监听的事件。 
+        events有这样几种类型，IOLoop.READ, IOLoop.WRITE, 还有IOLoop.ERROR. 很好理解，读写事件，还有错误异常。
+        当我们选定的类型事件发生的时候，那么就会执行handler(fd, events)。
+        """
         fd, obj = self.split_fd(fd)
         self._handlers[fd] = (obj, stack_context.wrap(handler))
         self._impl.register(fd, events | self.ERROR)
@@ -877,6 +916,7 @@ class PollIOLoop(IOLoop):
             signal.signal(signal.SIGALRM,
                           action if action is not None else signal.SIG_DFL)
 
+    # ioloop 最核心的部分
     def start(self):
         if self._running:
             raise RuntimeError("IOLoop is already running")
@@ -925,6 +965,7 @@ class PollIOLoop(IOLoop):
                 old_wakeup_fd = None
 
         try:
+            # 服务器进程正式开始，类似于其他服务器的 serve_forever
             while True:
                 # Prevent IO event starvation by delaying new callbacks
                 # to the next iteration of the event loop.
@@ -934,62 +975,81 @@ class PollIOLoop(IOLoop):
                 # Do not run anything until we have determined which ones
                 # are ready, so timeouts that call add_timeout cannot
                 # schedule anything in this iteration.
+                # 用于存放这个周期内已过期（ 已超时 ）的任务
                 due_timeouts = []
                 if self._timeouts:
                     now = self.time()
+                    # _timeouts 有数据时一直循环, _timeouts 是个最小堆，第一个数据永远是最小的， 这里第一个数据永远是最接近超时或已超时的
                     while self._timeouts:
                         if self._timeouts[0].callback is None:
                             # The timeout was cancelled.  Note that the
                             # cancellation check is repeated below for timeouts
                             # that are cancelled by another timeout or callback.
+                            # 超时任务无回调, 直接弹出, 超时计数器 －1
                             heapq.heappop(self._timeouts)
                             self._cancellations -= 1
                         elif self._timeouts[0].deadline <= now:
+                            # 判断最小的数据是否超时, 超时就加到已超时列表里
                             due_timeouts.append(heapq.heappop(self._timeouts))
                         else:
+                            # 因为最小堆，如果没超时就直接退出循环（ 后面的数据必定未超时 ）
                             break
                     if (self._cancellations > 512 and
                             self._cancellations > (len(self._timeouts) >> 1)):
                         # Clean up the timeout queue when it gets large and it's
                         # more than half cancellations.
+                        # 当超时计数器大于 512 并且 大于 _timeouts 长度一半（ >> 为右移运算， 相当于十进制数据被除 2 ）时，
+                        # 清零计数器，并剔除 _timeouts 中无 callbacks 的任务
                         self._cancellations = 0
                         self._timeouts = [x for x in self._timeouts
                                           if x.callback is not None]
+                        # 进行 _timeouts 最小堆化
                         heapq.heapify(self._timeouts)
 
+                # 运行 callbacks 里所有的 calllback
                 for i in range(ncallbacks):
                     self._run_callback(self._callbacks.popleft())
+
+                # 运行所有已过期任务的 callback
                 for timeout in due_timeouts:
                     if timeout.callback is not None:
                         self._run_callback(timeout.callback)
+
                 # Closures may be holding on to a lot of memory, so allow
                 # them to be freed before we go into our poll wait.
+                # 释放内存
                 due_timeouts = timeout = None
 
                 if self._callbacks:
                     # If any callbacks or timeouts called add_callback,
                     # we don't want to wait in poll() before we run them.
+                    # _callbacks 里有数据时, 设置 epoll_wait 时间为0（ 立即返回 ）
                     poll_timeout = 0.0
                 elif self._timeouts:
                     # If there are any timeouts, schedule the first one.
                     # Use self.time() instead of 'now' to account for time
                     # spent running callbacks.
+                    # _timeouts 里有数据时,# 取最小过期时间当 epoll_wait 等待时间，这样当第一个任务过期时立即返回,
+                    # 果最小过期时间大于默认等待时间 _POLL_TIMEOUT ＝ 3600，则用 3600，如果最小过期时间小于0 就设置为0 立即返回。
                     poll_timeout = self._timeouts[0].deadline - self.time()
                     poll_timeout = max(0, min(poll_timeout, _POLL_TIMEOUT))
                 else:
                     # No timeouts and no callbacks, so use the default.
+                    # # 默认 3600 s 等待时间
                     poll_timeout = _POLL_TIMEOUT
 
+                # 检查是否有系统信号中断运行，有则中断，无则继续
                 if not self._running:
                     break
 
                 if self._blocking_signal_threshold is not None:
                     # clear alarm so it doesn't fire while poll is waiting for
                     # events.
+                    # 开始 epoll_wait 之前确保 signal alarm 都被清空（ 这样在 epoll_wait 过程中不会被 signal alarm 打断 ）
                     signal.setitimer(signal.ITIMER_REAL, 0, 0)
 
                 try:
-                    event_pairs = self._impl.poll(poll_timeout)
+                    event_pairs = self._impl.poll(poll_timeout) # 获取返回的活跃事件
                 except Exception as e:
                     # Depending on python version and IOLoop implementation,
                     # different exception types may be thrown and there are
@@ -1009,11 +1069,11 @@ class PollIOLoop(IOLoop):
                 # its handler. Since that handler may perform actions on
                 # other file descriptors, there may be reentrant calls to
                 # this IOLoop that modify self._events
-                self._events.update(event_pairs)
+                self._events.update(event_pairs) # 将活跃事件加入 _events
                 while self._events:
-                    fd, events = self._events.popitem()
+                    fd, events = self._events.popitem() # 循环弹出事件
                     try:
-                        fd_obj, handler_func = self._handlers[fd]
+                        fd_obj, handler_func = self._handlers[fd] # 处理事件
                         handler_func(fd_obj, events)
                     except (OSError, IOError) as e:
                         if errno_from_exception(e) == errno.EPIPE:
@@ -1027,6 +1087,7 @@ class PollIOLoop(IOLoop):
 
         finally:
             # reset the stopped flag so another start/stop pair can be issued
+            # 确保发生异常也继续运行
             self._stopped = False
             if self._blocking_signal_threshold is not None:
                 signal.setitimer(signal.ITIMER_REAL, 0, 0)
@@ -1037,7 +1098,7 @@ class PollIOLoop(IOLoop):
     def stop(self):
         self._running = False
         self._stopped = True
-        self._waker.wake()
+        self._waker.wake() # 向 pipe 写入随意字符唤醒 ioloop 事件循环
 
     def time(self):
         return self.time_func()
