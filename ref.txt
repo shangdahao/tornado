@@ -1,0 +1,9 @@
+tornado 参考资料：
+
+https://www.gitbook.com/book/huangxiaohen2738/tornado-tcp-program/details
+
+https://segmentfault.com/a/1190000005659237
+
+https://www.zhihu.com/question/20122137
+
+http://golubenco.org/understanding-the-code-inside-tornado-the-asynchronous-web-server-powering-friendfeed.html
