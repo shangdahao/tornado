@@ -14,7 +14,22 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
-"""A non-blocking, single-threaded TCP server."""
+"""
+A non-blocking, single-threaded TCP server.
+
+对于 TCP 编程的总结就是：创建一个监听 socket，然后把它绑定到端口和地址上并开始监听，然后不停 accept。这也是 tornado 的 TCPServer 要做的工作
+
+它有两种用法：bind+start 或者 listen。
+
+简言之，基于事件驱动的服务器（tornado）要干的事就是：创建 socket，绑定到端口并 listen，然后注册事件和对应的回调，在回调里accept 新请求。
+
+那么如何理解non-blocking呢？ non-blocking，就是说，这个服务器没有使用阻塞式API。 
+通常来说，我们socket的读写都是阻塞式的,不管有没有数据，服务器都派API去读，读不到，API就不会回来交差。而非阻塞区别在于没有数据可读时，它不会在那死等，它直接就返回了。
+而single-thread，说的是服务器是单线程模式，一个线程可以监视成千上万的连接，因此不需要多线程。在ubuntu上用的是epoll，bsd用的是kqueue。
+
+
+
+"""
 from __future__ import absolute_import, division, print_function
 
 import errno
