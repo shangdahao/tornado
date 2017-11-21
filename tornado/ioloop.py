@@ -636,8 +636,6 @@ class IOLoop(Configurable):
         To add a callback from a signal handler, see
         `add_callback_from_signal`.
         
-        这个函数是最简单的，在ioloop开启后执行的回调函数callback，args和*kwargs都是这个回调函数的参数。
-        一般我们的server都是单进程单线程的，即使是多线程，那么这个函数也是安全的。
         """
         raise NotImplementedError()
 
