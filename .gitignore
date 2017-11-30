@@ -17,3 +17,4 @@ secrets.cfg
 .mypy_cache/
 *.xml
 .idea/
+*.DS_Store
